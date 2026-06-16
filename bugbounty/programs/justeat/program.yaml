@@ -1,0 +1,39 @@
+name: justeat
+platform: bugcrowd
+url: https://bugcrowd.com/justeattakeaway
+h1_handle: ""                 # only for hackerone programs
+
+scope_file: ./scope.txt
+out_of_scope_file: ./out-of-scope.txt
+
+mode: passive
+allow_intrusive: false
+forbid_active: false
+rate_limit: 80
+resume: true
+
+rewards:
+  p1: 5000
+  p2: 4000
+
+last_run: null
+
+# Shared assets resolved from ~/bugbounty/ when present
+resolvers: ~/bugbounty/resolvers.txt
+wordlist_subdomains: ~/bugbounty/wordlists/subdomains-top1m.txt
+tools_path: ~/.pdtm/go/bin
+
+webhook_url: ""
+
+phases:
+  asset_discovery: true
+  cloud_buckets: true
+  http_probe: true
+  url_harvest: true
+  js_analysis: true
+  param_discovery: true
+  vuln_scan: true
+  auth_surface: true
+  jwt_analysis: true
+  verify: true
+  screenshots: false

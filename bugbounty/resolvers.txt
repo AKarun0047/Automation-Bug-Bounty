@@ -1,0 +1,2 @@
+# Placeholder — symlink or copy shared resolvers here
+# wget https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt -O ~/bugbounty/resolvers.txt

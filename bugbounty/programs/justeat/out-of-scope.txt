@@ -1,0 +1,4 @@
+# Explicit out-of-scope — never probe these even if discovered passively
+stripe.com
+salesforce.com
+*.s3.amazonaws.com

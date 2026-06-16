@@ -1,0 +1,43 @@
+# Autonomous Recon Automation — config template
+# Usage: python -m recon --config recon.config.yaml
+
+target: ""                    # single domain OR leave empty when using scope_file
+scope_file: ""                # one domain per line
+out_dir: ""                   # auto: ./recon-{TARGET}-{DATE}; multi-target uses subdirs
+threads: 50
+rate_limit: 150               # requests/sec global cap (applied to HTTP probe loops)
+resolvers: "./resolvers.txt"
+wordlist_subdomains: "./wordlists/subdomains-top1m.txt"
+auth_cookies: ""              # session value only — for authenticated crawl
+burp_collab: ""               # interactsh or burp collab URL for OOB
+tools_path: "~/.pdtm/go/bin"
+
+# Optional integrations
+shodan_api_key: ""            # or set SHODAN_API_KEY env var — favicon hash → Shodan lookup
+github_org: ""                # default: first label of target (e.g. example from example.com)
+webhook_url: ""               # Slack/generic webhook — notified on completion
+resume: true                  # skip phases recorded in .recon_state.json
+mode: passive                 # passive = discovery only; active = send probes/payloads
+allow_intrusive: false        # requires mode:active — reset emails, 3rd-party auth validation
+
+# Scope rules
+in_scope_regex: []
+out_of_scope_regex:
+  - ".*\\.s3\\.amazonaws\\.com"
+  - ".*\\.cloudfront\\.net"
+  - ".*stripe\\.com"
+  - ".*salesforce\\.com"
+
+# Phase toggles
+phases:
+  asset_discovery: true
+  cloud_buckets: true
+  http_probe: true
+  url_harvest: true
+  js_analysis: true
+  param_discovery: true
+  vuln_scan: true
+  auth_surface: true
+  jwt_analysis: true
+  verify: true
+  screenshots: true

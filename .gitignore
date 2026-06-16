@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.recon-target-override.yaml
+my-target.yaml
+recon-*/
+bugbounty/programs/*/runs/

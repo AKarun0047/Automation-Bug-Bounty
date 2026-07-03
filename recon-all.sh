@@ -63,6 +63,18 @@ cap_lines() {
   head -n "$3" "$1" >"$2"
 }
 
+# Returns 0 if file exists, is non-empty, and was modified within LOOP_HOURS
+fresh_output() {
+  local f="$1"
+  [ -s "$f" ] || return 1
+  [ "$DAEMON" -eq 1 ] || return 1
+  local age_s now mod
+  now="$(date +%s)"
+  mod="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"
+  age_s=$(( now - mod ))
+  [ "$age_s" -lt "$(( LOOP_HOURS * 3600 ))" ]
+}
+
 wordlist() {
   local name="$1"
   [ -f "${WORDLISTS_DIR}/${name}" ] && echo "${WORDLISTS_DIR}/${name}" && return 0
@@ -142,35 +154,49 @@ phase_subdomains() {
   backup_if_exists "$subs" "$tmp/subdomains_prev.txt"
   : >"$subs"
 
-  log "[$target] Phase 1: subdomain discovery"
+  log "[$target] Phase 1: subdomain discovery (parallel)"
 
+  # All these hit DIFFERENT sources — run in parallel
   if have subfinder; then
-    subfinder -d "$target" -all -recursive -silent -o "$tmp/subfinder.txt" 2>/dev/null || true
-    cat "$tmp/subfinder.txt" >>"$subs" 2>/dev/null || true
-    rate_sleep
+    subfinder -d "$target" -all -recursive -silent -o "$tmp/subfinder.txt" 2>/dev/null &
   else warn "subfinder not found — run ./install.sh"; fi
 
-  if have assetfinder; then
-    assetfinder --subs-only "$target" >>"$subs" 2>/dev/null || true
-    rate_sleep
+  have assetfinder && assetfinder --subs-only "$target" >"$tmp/assetfinder.txt" 2>/dev/null &
+
+  have amass && timeout 600 amass enum -passive -d "$target" -o "$tmp/amass.txt" 2>/dev/null &
+
+  curl -fsSL --max-time 30 "https://crt.sh/?q=%25.${target}&output=json" 2>/dev/null \
+    | grep -oP '"name_value"\s*:\s*"\K[^"]+' 2>/dev/null \
+    | tr ',' '\n' | sed 's/^\*\.//' >"$tmp/crtsh.txt" 2>/dev/null &
+
+  curl -fsSL --max-time 15 "https://api.hackertarget.com/hostsearch/?q=${target}" 2>/dev/null \
+    | cut -d, -f1 >"$tmp/hackertarget.txt" 2>/dev/null &
+
+  curl -fsSL --max-time 15 "https://api.certspotter.com/v1/issuances?domain=${target}&include_subdomains=true&expand=dns_names" 2>/dev/null \
+    | grep -oE '"[a-zA-Z0-9._-]+\.'"${target//./\\.}"'"' 2>/dev/null \
+    | tr -d '"' >"$tmp/certspotter.txt" 2>/dev/null &
+
+  if have chaos && [ -n "${PDCP_API_KEY:-}" ]; then
+    chaos -d "$target" -silent >"$tmp/chaos.txt" 2>/dev/null &
   fi
 
-  if have amass; then
-    timeout 600 amass enum -passive -d "$target" -o "$tmp/amass.txt" 2>/dev/null || true
-    cat "$tmp/amass.txt" >>"$subs" 2>/dev/null || true
-    rate_sleep
-  fi
+  have gungnir && echo "$target" | timeout 30 gungnir -r >"$tmp/gungnir.txt" 2>/dev/null &
 
-  if have curl; then
-    curl -fsSL "https://crt.sh/?q=%25.${target}&output=json" 2>/dev/null \
-      | grep -oP '"name_value"\s*:\s*"\K[^"]+' 2>/dev/null \
-      | tr ',' '\n' | sed 's/^\*\.//' >>"$subs" || true
-    rate_sleep
-  fi
+  wait
+  # Merge all parallel results
+  cat "$tmp"/subfinder.txt "$tmp"/assetfinder.txt "$tmp"/amass.txt "$tmp"/crtsh.txt \
+    "$tmp"/hackertarget.txt "$tmp"/certspotter.txt "$tmp"/chaos.txt "$tmp"/gungnir.txt \
+    >>"$subs" 2>/dev/null || true
 
-  curl -fsSL "https://api.hackertarget.com/hostsearch/?q=${target}" 2>/dev/null \
-    | cut -d, -f1 >>"$subs" || true
-  rate_sleep
+  # DNS zone transfer (fast, sequential is fine)
+  if have dig; then
+    local ns
+    ns="$(dig +short NS "$target" 2>/dev/null | head -1 | sed 's/\.$//')"
+    if [ -n "$ns" ]; then
+      dig axfr "@${ns}" "$target" 2>/dev/null \
+        | awk '/IN/{print $1}' | sed 's/\.$//' | grep -iF ".${target}" >>"$subs" || true
+    fi
+  fi
 
   echo "$target" >>"$subs"
   echo "www.${target}" >>"$subs"
@@ -218,7 +244,6 @@ phase_subdomain_bruteforce() {
     done
     dedupe_file "$subs"
   fi
-  rate_sleep
 }
 
 phase_scope_filter() {
@@ -246,7 +271,6 @@ phase_scope_filter() {
   else
     warn "[$target] Scope filter removed everything — check $scope"
   fi
-  rate_sleep
 }
 
 phase_dnsx() {
@@ -265,7 +289,6 @@ phase_dnsx() {
   if [ -s "$tmp/dnsx_raw.txt" ]; then
     awk '{print $1}' "$tmp/dnsx_raw.txt" | tr '[:upper:]' '[:lower:]' | sort -u >"$out"
   fi
-  rate_sleep
   log "[$target] DNS resolved: $(count_lines "$out")"
 }
 
@@ -292,7 +315,6 @@ phase_permutations() {
     dedupe_file "$subs"
     log "[$target] After permutations: $(count_lines "$subs") subs"
   fi
-  rate_sleep
 }
 
 phase_live_and_ports() {
@@ -364,12 +386,8 @@ phase_live_and_ports() {
 
   if have nmap && [ -s "$live" ]; then
     head -n 30 "$live" | sed -E 's|https?://||; s|/.*||; s|:.*||' | sort -u >"$tmp/nmap_hosts.txt"
-    while IFS= read -r host; do
-      nmap -sV -T3 --max-rate "$RATE_LIMIT" -Pn -p "$NAABU_PORTS" \
-        "$host" >>"$nmap_out" 2>/dev/null || true
-      sleep 2
-    done <"$tmp/nmap_hosts.txt"
-    rate_sleep
+    nmap -sV -T3 --max-rate "$RATE_LIMIT" -Pn -p "$NAABU_PORTS" \
+      -iL "$tmp/nmap_hosts.txt" -oN "$nmap_out" 2>/dev/null || true
   elif [ -s "$ports" ]; then
     { echo "# naabu (nmap unavailable)"; cat "$ports"; } >"$nmap_out"
   fi
@@ -381,49 +399,40 @@ phase_urls() {
   local sensitive="$dir/sensitive_urls.txt"
   local tmp="$dir/.tmp"
 
-  log "[$target] Phase 3: URL harvest"
+  log "[$target] Phase 3: URL harvest (parallel)"
   : >"$urls"
 
+  # All hit different data sources — run parallel
   if have gauplus; then
     gauplus --threads 5 --subs "$target" --blacklist ttf,woff,woff2,svg,png,jpg,gif,ico,css \
-      2>/dev/null >>"$urls" || true
-    rate_sleep
+      >"$tmp/gauplus.txt" 2>/dev/null &
   elif have gau; then
-    gau --subs "$target" 2>/dev/null >>"$urls" || true
-    rate_sleep
+    gau --subs "$target" >"$tmp/gauplus.txt" 2>/dev/null &
   fi
 
-  if have waybackurls; then
-    waybackurls "$target" 2>/dev/null >>"$urls" || true
-    rate_sleep
-  fi
-
-  if have waymore; then
-    waymore -i "$target" -mode U -oU "$tmp/waymore.txt" 2>/dev/null || true
-    [ -f "$tmp/waymore.txt" ] && cat "$tmp/waymore.txt" >>"$urls"
-    rate_sleep
-  fi
+  have waymore && waymore -i "$target" -mode U -oU "$tmp/waymore.txt" 2>/dev/null &
 
   if have gospider && [ -s "$dir/live_hosts.txt" ]; then
     head -n 1 "$dir/live_hosts.txt" | while read -r seed; do
       gospider -s "$seed" -d 2 -c 5 -t 5 --other-source -q 2>/dev/null \
-        | grep -oE 'https?://[^ ]+' >>"$urls" || true
-    done
-    rate_sleep
+        | grep -oE 'https?://[^ ]+' >"$tmp/gospider.txt" || true
+    done &
   fi
 
   if have hakrawler && [ -s "$dir/live_hosts.txt" ]; then
     head -n 5 "$dir/live_hosts.txt" | while read -r seed; do
-      echo "$seed" | hakrawler -depth 2 -plain 2>/dev/null >>"$urls" || true
-    done
-    rate_sleep
+      echo "$seed" | hakrawler -depth 2 -plain 2>/dev/null
+    done >"$tmp/hakrawler.txt" &
   fi
 
   if have katana && [ -s "$dir/live_hosts.txt" ]; then
     head -n 15 "$dir/live_hosts.txt" >"$tmp/katana_seeds.txt"
-    katana -list "$tmp/katana_seeds.txt" -d 3 -jc -jsl -c 10 -silent 2>/dev/null >>"$urls" || true
-    rate_sleep
+    katana -list "$tmp/katana_seeds.txt" -d 3 -jc -jsl -c 10 -silent >"$tmp/katana.txt" 2>/dev/null &
   fi
+
+  wait
+  cat "$tmp"/gauplus.txt "$tmp"/waymore.txt "$tmp"/gospider.txt \
+    "$tmp"/hakrawler.txt "$tmp"/katana.txt >>"$urls" 2>/dev/null || true
 
   dedupe_file "$urls"
   grep -iE '^https?://' "$urls" >"$tmp/http.txt" 2>/dev/null && mv "$tmp/http.txt" "$urls" || true
@@ -431,13 +440,21 @@ phase_urls() {
   if have uro && [ -s "$urls" ]; then
     uro -i "$urls" -o "$tmp/uro.txt" 2>/dev/null || true
     [ -s "$tmp/uro.txt" ] && mv "$tmp/uro.txt" "$urls"
-    rate_sleep
   fi
 
   grep -iE 'admin|api|token|logout|password|secret|dashboard|staging|internal|debug|metrics|\.env|\.git|redirect=|url=|next=|callback=' \
     "$urls" 2>/dev/null | sort -u >"$sensitive" || : >"$sensitive"
 
-  log "[$target] URLs: $(count_lines "$urls") | Sensitive: $(count_lines "$sensitive")"
+  # Wayback backup/config file hunting
+  if [ -s "$urls" ]; then
+    grep -iE '\.(bak|zip|sql|config|old|backup|swp|tar\.gz|rar|7z|db|sqlite|dump)(\?|$)' "$urls" \
+      | sort -u >"$dir/backup_files.txt" 2>/dev/null || : >"$dir/backup_files.txt"
+    if have httpx && [ -s "$dir/backup_files.txt" ]; then
+      httpx -l "$dir/backup_files.txt" -silent -mc 200 -o "$dir/backup_files_live.txt" 2>/dev/null || : >"$dir/backup_files_live.txt"
+    fi
+  fi
+
+  log "[$target] URLs: $(count_lines "$urls") | Sensitive: $(count_lines "$sensitive") | Backup files: $(count_lines "$dir/backup_files.txt")"
 }
 
 phase_js_mining() {
@@ -486,6 +503,9 @@ phase_js_mining() {
       | grep -iE '/api|/v[0-9]|/internal|/admin|/graphql' >>"$endpoints" || true
     grep -iE '(api[_-]?key|apikey|secret[_-]?key|aws_access|private[_-]?key|password|token|mongodb\+srv|authorization)' "$f" 2>/dev/null \
       | grep -viE '^[[:space:]]*//' >>"$grep_secrets" || true
+    # Cloud storage URLs from JS
+    grep -iE '(firebaseio\.com|amazonaws\.com|cloudfront\.net|storage\.googleapis\.com|blob\.core\.windows\.net|digitaloceanspaces\.com)' \
+      "$f" 2>/dev/null >>"$dir/js_cloud_urls.txt" || true
     if [ -f "${LINKFINDER_DIR}/linkfinder.py" ] && have python3; then
       python3 "${LINKFINDER_DIR}/linkfinder.py" -i "$f" -o cli 2>/dev/null \
         | grep -iE '^/|https?://' >>"$endpoints" || true
@@ -508,8 +528,34 @@ phase_js_mining() {
 
   [ -s "$grep_secrets" ] && cat "$grep_secrets" >>"$secrets"
   dedupe_file "$secrets"
+  dedupe_file "$dir/js_cloud_urls.txt"
 
-  log "[$target] JS: $(count_lines "$js_out") files | endpoints: $(count_lines "$endpoints") | secrets: $(count_lines "$secrets")"
+  # Historical JS diff — find removed secrets via Wayback
+  : >"$dir/js_removed_secrets.txt"
+  if [ -s "$js_out" ]; then
+    head -n 10 "$js_out" | while read -r jsurl; do
+      [ -z "$jsurl" ] && continue
+      local ts_list
+      ts_list="$(curl -fsSL --max-time 10 \
+        "https://web.archive.org/cdx/search/cdx?url=${jsurl}&output=text&fl=timestamp&collapse=digest&limit=3" 2>/dev/null || true)"
+      [ -z "$ts_list" ] && continue
+      local oldest
+      oldest="$(echo "$ts_list" | head -1 | tr -d '[:space:]')"
+      [ -z "$oldest" ] && continue
+      local old_js new_js
+      old_js="$(curl -fsSL --max-time 15 "https://web.archive.org/web/${oldest}id_/${jsurl}" 2>/dev/null || true)"
+      new_js="$(curl -fsSL --max-time 15 "$jsurl" 2>/dev/null || true)"
+      if [ -n "$old_js" ] && [ -n "$new_js" ]; then
+        diff <(echo "$old_js") <(echo "$new_js") 2>/dev/null \
+          | grep '^[<]' | grep -iE 'key|token|secret|password|auth|api_key|bearer|AWS' \
+          | sed "s|^|[${jsurl}] |" >>"$dir/js_removed_secrets.txt" || true
+      fi
+      sleep 1
+    done
+    dedupe_file "$dir/js_removed_secrets.txt"
+  fi
+
+  log "[$target] JS: $(count_lines "$js_out") files | endpoints: $(count_lines "$endpoints") | secrets: $(count_lines "$secrets") | cloud_urls: $(count_lines "$dir/js_cloud_urls.txt") | removed_secrets: $(count_lines "$dir/js_removed_secrets.txt")"
 }
 
 phase_cloud_buckets() {
@@ -566,21 +612,18 @@ phase_params() {
       cat "$tmp/paramspider.txt" >>"$urls"
       dedupe_file "$urls"
     fi
-    rate_sleep
   fi
 
   # wayback CDX params
   curl -fsSL "https://web.archive.org/cdx/search/cdx?url=*.${target}/*&output=text&fl=original&collapse=urlkey&filter=statuscode:200" \
     2>/dev/null | grep '?' | sort -u >"$dir/wayback_params.txt" || : >"$dir/wayback_params.txt"
   [ -s "$dir/wayback_params.txt" ] && cat "$dir/wayback_params.txt" >>"$urls" && dedupe_file "$urls"
-  rate_sleep
 
   # gf classification
   if have gf && [ -s "$urls" ]; then
     for p in $patterns; do
       gf "$p" <"$urls" 2>/dev/null | sort -u >"$dir/params_${p}.txt" || : >"$dir/params_${p}.txt"
     done
-    rate_sleep
   elif [ -s "$urls" ]; then
     warn "gf not found — using grep fallback for params"
     grep -iE '[?&](url|uri|redirect|next|return|dest|target|callback)=' "$urls" | sort -u >"$dir/params_redirect.txt" || true
@@ -603,7 +646,13 @@ phase_params() {
     rate_sleep
   fi
 
-  log "[$target] Params — SSRF:$(count_lines "$dir/params_ssrf.txt") SQLi:$(count_lines "$dir/params_sqli.txt") Redirect:$(count_lines "$dir/params_redirect.txt")"
+  # qsreplace — prepare fuzz-ready URLs
+  : >"$dir/fuzz_ready.txt"
+  if have qsreplace && [ -s "$urls" ]; then
+    grep '=' "$urls" | qsreplace FUZZ | sort -u >"$dir/fuzz_ready.txt" 2>/dev/null || true
+  fi
+
+  log "[$target] Params — SSRF:$(count_lines "$dir/params_ssrf.txt") SQLi:$(count_lines "$dir/params_sqli.txt") Redirect:$(count_lines "$dir/params_redirect.txt") Fuzz-ready:$(count_lines "$dir/fuzz_ready.txt")"
 }
 
 phase_ffuf() {
@@ -675,6 +724,22 @@ phase_ffuf() {
       sleep 3
     done
     rate_sleep
+  fi
+
+  # Kiterunner — Swagger-aware API brute-force
+  if have kr && [ -s "$dir/priority_hosts.txt" ]; then
+    local kr_wl
+    kr_wl="$(wordlist routes-large.kite || true)"
+    if [ -n "$kr_wl" ]; then
+      log "[$target] Kiterunner API scan"
+      head -n 3 "$dir/priority_hosts.txt" | while read -r base; do
+        base="${base%/}"
+        kr scan "$base" -w "$kr_wl" -x 20 -d 4 2>/dev/null \
+          | grep -v "^$" >>"$dir/api_fuzz_results.txt" || true
+        sleep 2
+      done
+      rate_sleep
+    fi
   fi
 
   log "[$target] ffuf dirs:$(count_lines "$dir/dir_fuzz_results.txt") api:$(count_lines "$dir/api_fuzz_results.txt") vhosts:$(count_lines "$dir/vhost_fuzz_results.txt")"
@@ -811,6 +876,453 @@ phase_sensitive_paths() {
   log "[$(basename "$dir")] Sensitive paths: $(count_lines "$out")"
 }
 
+phase_osint() {
+  local target="$1" dir="$2"
+  local out="$dir/osint_intel.txt"
+  log "[$target] Phase 3d: OSINT (OTX + urlscan.io)"
+  : >"$out"
+
+  # OTX AlienVault threat intel
+  local otx
+  otx="$(curl -fsSL --max-time 15 "https://otx.alienvault.com/api/v1/indicators/domain/${target}/general" 2>/dev/null || true)"
+  if [ -n "$otx" ] && have jq; then
+    local pulses
+    pulses="$(echo "$otx" | jq -r '.pulse_info.count // 0' 2>/dev/null || echo 0)"
+    [ "$pulses" -gt 0 ] 2>/dev/null && echo "OTX: ${pulses} threat pulses — https://otx.alienvault.com/indicator/domain/${target}" >>"$out"
+  fi
+  rate_sleep
+
+  # urlscan.io infrastructure
+  local uscan
+  uscan="$(curl -fsSL --max-time 15 "https://urlscan.io/api/v1/search/?q=domain:${target}&size=10" 2>/dev/null || true)"
+  if [ -n "$uscan" ] && have jq; then
+    echo "$uscan" | jq -r '.results[]?.page | select(.ip != null) | "urlscan: \(.ip) server=\(.server // "?")"' 2>/dev/null \
+      | sort -u >>"$out" || true
+  fi
+  rate_sleep
+
+  log "[$target] OSINT intel: $(count_lines "$out")"
+}
+
+phase_403_bypass() {
+  local target="$1" dir="$2"
+  local sensitive="$dir/sensitive_paths.txt"
+  local out="$dir/403_bypass_results.txt"
+  log "[$target] Phase 5e: 403 bypass attempts"
+  : >"$out"
+
+  [ -s "$sensitive" ] || return
+
+  local blocked
+  blocked="$(grep '→ 403' "$sensitive" 2>/dev/null | head -n 20 || true)"
+  [ -z "$blocked" ] && return
+
+  local headers=(
+    "X-Original-URL: /.env"
+    "X-Rewrite-URL: /.env"
+    "X-Forwarded-For: 127.0.0.1"
+    "X-Custom-IP-Authorization: 127.0.0.1"
+    "X-Forwarded-Host: localhost"
+    "X-Real-IP: 127.0.0.1"
+    "X-Client-IP: 127.0.0.1"
+  )
+
+  echo "$blocked" | while read -r line; do
+    local url="${line%% →*}"
+    [ -z "$url" ] && continue
+    for h in "${headers[@]}"; do
+      local code
+      code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 -H "$h" "$url" 2>/dev/null || echo 0)"
+      if [ "$code" = "200" ]; then
+        echo "BYPASS: $url via $h → 200" >>"$out"
+      fi
+      sleep 0.3
+    done
+  done
+  rate_sleep
+  log "[$target] 403 bypasses: $(count_lines "$out")"
+}
+
+phase_security_headers() {
+  local target="$1" dir="$2"
+  local out="$dir/security_headers.txt"
+  log "[$target] Phase 9a: security headers audit"
+  : >"$out"
+
+  [ -s "$dir/priority_hosts.txt" ] || return
+
+  head -n 10 "$dir/priority_hosts.txt" | while read -r url; do
+    [ -z "$url" ] && continue
+    local hdrs
+    hdrs="$(curl -sk -D- -o /dev/null --max-time 10 -L "$url" 2>/dev/null || true)"
+    [ -z "$hdrs" ] && continue
+
+    local missing=""
+    echo "$hdrs" | grep -qi 'strict-transport-security' || missing="${missing} HSTS"
+    echo "$hdrs" | grep -qi 'content-security-policy' || missing="${missing} CSP"
+    echo "$hdrs" | grep -qi 'x-frame-options' || missing="${missing} X-Frame-Options"
+    echo "$hdrs" | grep -qi 'x-content-type-options' || missing="${missing} X-Content-Type-Options"
+    echo "$hdrs" | grep -qi 'referrer-policy' || missing="${missing} Referrer-Policy"
+    [ -n "$missing" ] && echo "$url missing:${missing}" >>"$out"
+
+    local srv
+    srv="$(echo "$hdrs" | grep -i '^server:' | head -1 | sed 's/^[Ss]erver: *//' | tr -d '\r')"
+    [ -n "$srv" ] && echo "$url server: $srv" >>"$out"
+  done
+  rate_sleep
+  log "[$target] Security header issues: $(count_lines "$out")"
+}
+
+phase_csp_analysis() {
+  local target="$1" dir="$2"
+  local out="$dir/csp_leaks.txt"
+  log "[$target] Phase 9b: CSP info leak analysis"
+  : >"$out"
+
+  [ -s "$dir/priority_hosts.txt" ] || return
+
+  head -n 10 "$dir/priority_hosts.txt" | while read -r url; do
+    [ -z "$url" ] && continue
+    local full_resp
+    full_resp="$(curl -sk -D- --max-time 10 -L "$url" 2>/dev/null || true)"
+    [ -z "$full_resp" ] && continue
+
+    local csp=""
+    csp="$(echo "$full_resp" | grep -i 'content-security-policy' | head -1 || true)"
+    [ -z "$csp" ] && csp="$(echo "$full_resp" | grep -oi 'content="[^"]*default-src[^"]*"' | head -1 || true)"
+    [ -z "$csp" ] && continue
+
+    echo "$csp" | grep -oE 'https?://[a-zA-Z0-9._/-]+' 2>/dev/null | while read -r csp_url; do
+      if echo "$csp_url" | grep -qiE 'staging|sandbox|dev\.|test\.|demo|beta|internal|uat|preprod'; then
+        echo "$url CSP leaks: $csp_url" >>"$out"
+      fi
+    done
+  done
+  log "[$target] CSP leaks: $(count_lines "$out")"
+}
+
+phase_ssl_check() {
+  local target="$1" dir="$2"
+  local out="$dir/ssl_issues.txt"
+  log "[$target] Phase 9c: SSL cert checks"
+  : >"$out"
+
+  [ -s "$dir/subdomains.txt" ] || return
+
+  head -n 100 "$dir/subdomains.txt" | xargs -P 10 -I{} bash -c '
+    host="{}"; out="'"$out"'"
+    cert_pem="$(echo | timeout 5 openssl s_client -servername "$host" -connect "${host}:443" 2>/dev/null || true)"
+    [ -z "$cert_pem" ] && exit 0
+    if ! echo "$cert_pem" | openssl x509 -noout -checkend 0 2>/dev/null; then
+      expiry="$(echo "$cert_pem" | openssl x509 -noout -enddate 2>/dev/null | sed "s/notAfter=//" || true)"
+      echo "EXPIRED: $host (was: $expiry)" >>"$out"
+    elif ! echo "$cert_pem" | openssl x509 -noout -checkend 2592000 2>/dev/null; then
+      expiry="$(echo "$cert_pem" | openssl x509 -noout -enddate 2>/dev/null | sed "s/notAfter=//" || true)"
+      echo "EXPIRING <30d: $host ($expiry)" >>"$out"
+    fi
+  '
+  log "[$target] SSL issues: $(count_lines "$out")"
+}
+
+phase_open_redirects() {
+  local target="$1" dir="$2"
+  local out="$dir/open_redirects.txt"
+  log "[$target] Phase 9d: open redirect testing"
+  : >"$out"
+
+  local base="https://${target}"
+  local payloads=(
+    "/redirect?url=https://evil.com"
+    "/redirect?next=https://evil.com"
+    "/login?redirect_uri=https://evil.com"
+    "/login?next=https://evil.com"
+    "/login?return=https://evil.com"
+    "/auth?callback=https://evil.com"
+    "/files/../../evil.com"
+    "/files/..%2F..%2Fevil.com"
+    "/files/@evil.com"
+    "//evil.com"
+  )
+
+  for p in "${payloads[@]}"; do
+    local code loc
+    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "${base}${p}" 2>/dev/null || echo 0)"
+    case "$code" in 301|302|307|308)
+      loc="$(curl -sk -D- -o /dev/null --max-time 8 "${base}${p}" 2>/dev/null \
+        | grep -i '^location:' | head -1 | tr -d '\r' || true)"
+      echo "$loc" | grep -qi 'evil.com' && echo "REDIRECT: ${base}${p} → ${loc}" >>"$out"
+      ;;
+    esac
+    sleep 0.3
+  done
+
+  # Test redirect params found by gf/grep
+  if [ -s "$dir/params_redirect.txt" ]; then
+    head -n 20 "$dir/params_redirect.txt" | while read -r url; do
+      [ -z "$url" ] && continue
+      local test_url code loc
+      test_url="$(echo "$url" | sed -E 's/(redirect|next|return|callback|url|dest|target|uri)=[^&]*/\1=https:\/\/evil.com/g')"
+      code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "$test_url" 2>/dev/null || echo 0)"
+      case "$code" in 301|302|307|308)
+        loc="$(curl -sk -D- -o /dev/null --max-time 8 "$test_url" 2>/dev/null \
+          | grep -i '^location:' | head -1 | tr -d '\r' || true)"
+        echo "$loc" | grep -qi 'evil.com' && echo "REDIRECT: ${test_url} → ${loc}" >>"$out"
+        ;;
+      esac
+      sleep 0.3
+    done
+  fi
+
+  log "[$target] Open redirects: $(count_lines "$out")"
+}
+
+phase_keycloak() {
+  local target="$1" dir="$2"
+  local out="$dir/keycloak_findings.txt"
+  log "[$target] Phase 9e: Keycloak/OIDC probing"
+  : >"$out"
+
+  [ -s "$dir/live_hosts.txt" ] || return
+
+  local auth_hosts
+  auth_hosts="$(grep -iE 'auth|sso|login|keycloak|identity|cas|adfs' "$dir/live_hosts.txt" 2>/dev/null | head -n 10 || true)"
+  [ -z "$auth_hosts" ] && return
+
+  local realms=("master" "admin" "test" "default" "staging" "dev")
+  local default_clients=("admin-cli" "realm-management" "account" "account-console" "security-admin-console" "broker")
+
+  echo "$auth_hosts" | while read -r base; do
+    base="${base%/}"
+    [ -z "$base" ] && continue
+
+    # OIDC discovery
+    local oidc
+    oidc="$(curl -sk --max-time 10 "${base}/.well-known/openid-configuration" 2>/dev/null || true)"
+    if echo "$oidc" | grep -q '"issuer"' 2>/dev/null; then
+      echo "OIDC EXPOSED: ${base}/.well-known/openid-configuration" >>"$out"
+      if have jq; then
+        local issuer
+        issuer="$(echo "$oidc" | jq -r '.issuer // empty' 2>/dev/null || true)"
+        [ -n "$issuer" ] && echo "  issuer: $issuer" >>"$out"
+        for g in password client_credentials implicit; do
+          echo "$oidc" | jq -r '.grant_types_supported[]?' 2>/dev/null | grep -qF "$g" \
+            && echo "  DANGEROUS GRANT: $g" >>"$out"
+        done
+        local reg
+        reg="$(echo "$oidc" | jq -r '.registration_endpoint // empty' 2>/dev/null || true)"
+        [ -n "$reg" ] && echo "  DYNAMIC CLIENT REGISTRATION: $reg" >>"$out"
+      fi
+    fi
+
+    # Keycloak realm probing
+    for realm in "${realms[@]}"; do
+      for prefix in "/auth/realms" "/realms"; do
+        local rurl="${base}${prefix}/${realm}"
+        local rdata
+        rdata="$(curl -sk --max-time 8 "$rurl" 2>/dev/null || true)"
+        echo "$rdata" | grep -q '"public_key"' 2>/dev/null || continue
+
+        echo "KEYCLOAK REALM: $rurl" >>"$out"
+        if have jq; then
+          local pk
+          pk="$(echo "$rdata" | jq -r '.public_key // empty' 2>/dev/null | head -c 50)"
+          [ -n "$pk" ] && echo "  public_key: ${pk}..." >>"$out"
+        fi
+
+        # Default client_credentials grant
+        local token_url="${rurl}/protocol/openid-connect/token"
+        for cid in "${default_clients[@]}"; do
+          local tresp
+          tresp="$(curl -sk --max-time 8 -X POST "$token_url" \
+            -d "grant_type=client_credentials&client_id=${cid}" 2>/dev/null || true)"
+          if echo "$tresp" | grep -q 'access_token' 2>/dev/null; then
+            echo "  CRITICAL: client_credentials for '${cid}' succeeded WITHOUT secret!" >>"$out"
+          elif echo "$tresp" | grep -q 'Public client' 2>/dev/null; then
+            echo "  PUBLIC CLIENT: ${cid}" >>"$out"
+          fi
+        done
+      done
+    done
+
+    # Scan page for embedded Keycloak realm URLs
+    local body
+    body="$(curl -sk --max-time 10 -L "$base" 2>/dev/null || true)"
+    echo "$body" | grep -oE 'https?://[a-zA-Z0-9._-]+/auth/realms/[a-zA-Z0-9_-]+' 2>/dev/null \
+      | sort -u | while read -r realm_url; do
+        echo "REALM URL IN PAGE: $realm_url (src: $base)" >>"$out"
+      done
+
+    sleep 1
+  done
+  rate_sleep
+  log "[$target] Keycloak/OIDC findings: $(count_lines "$out")"
+}
+
+phase_whois_cname() {
+  local target="$1" dir="$2"
+  local out="$dir/whois_cname_check.txt"
+  local tmp="$dir/.tmp"
+  log "[$target] Phase 9f: WHOIS check on CNAME targets"
+  : >"$out"
+
+  have whois || return
+  [ -f "$tmp/dnsx_raw.txt" ] || return
+
+  grep -i 'cname' "$tmp/dnsx_raw.txt" 2>/dev/null \
+    | grep -oE '[a-zA-Z0-9.-]+\.[a-z]{2,}' \
+    | awk -F. '{print $(NF-1)"."$NF}' \
+    | sort -u \
+    | grep -vF "$target" >"$tmp/cname_roots.txt" 2>/dev/null || true
+
+  [ -s "$tmp/cname_roots.txt" ] || return
+
+  while read -r root; do
+    [ -z "$root" ] && continue
+    local whois_data
+    whois_data="$(timeout 15 whois "$root" 2>/dev/null || true)"
+    [ -z "$whois_data" ] && continue
+
+    local expiry
+    expiry="$(echo "$whois_data" | grep -iE 'expir|expiry' | head -1 | xargs || true)"
+    [ -n "$expiry" ] && echo "CNAME target $root: $expiry" >>"$out"
+    sleep 1
+  done <"$tmp/cname_roots.txt"
+
+  rate_sleep
+  log "[$target] WHOIS CNAME checks: $(count_lines "$out")"
+}
+
+phase_asn() {
+  local target="$1" dir="$2"
+  local out="$dir/asn_hosts.txt"
+  local tmp="$dir/.tmp"
+  log "[$target] Phase 2b: ASN/CIDR infrastructure mapping"
+  : >"$out"
+
+  if ! have asnmap; then return; fi
+
+  local cidrs
+  cidrs="$(asnmap -d "$target" -silent 2>/dev/null || true)"
+  [ -z "$cidrs" ] && return
+
+  echo "$cidrs" >"$tmp/asn_cidrs.txt"
+  log "[$target] ASN CIDRs: $(count_lines "$tmp/asn_cidrs.txt")"
+
+  # Reverse DNS on CIDRs — find hostnames by IP
+  if have mapcidr && have dnsx; then
+    mapcidr -l "$tmp/asn_cidrs.txt" -silent 2>/dev/null \
+      | dnsx -ptr -resp-only -silent 2>/dev/null \
+      | grep -iF "$(echo "$target" | awk -F. '{print $(NF-1)"."$NF}')" \
+      >>"$dir/subdomains.txt" || true
+    dedupe_file "$dir/subdomains.txt"
+  fi
+
+  # Port scan + web detect on CIDRs
+  if have naabu; then
+    naabu -list "$tmp/asn_cidrs.txt" -p "$NAABU_PORTS" -rate "$RATE_LIMIT" -silent 2>/dev/null \
+      >"$tmp/asn_ports.txt" || true
+    if [ -s "$tmp/asn_ports.txt" ] && have httpx; then
+      httpx -l "$tmp/asn_ports.txt" -silent -status-code -title 2>/dev/null >"$out" || true
+    fi
+  fi
+
+  rate_sleep
+  log "[$target] ASN hosts: $(count_lines "$out")"
+}
+
+phase_google_dorks() {
+  local target="$1" dir="$2"
+  local out="$dir/google_dorks.txt"
+  log "[$target] Phase 3e: Google dork queries"
+  : >"$out"
+
+  local slug="${target%%.*}"
+  {
+    echo "site:*.${target} -www"
+    echo "site:${target} filetype:env OR filetype:sql OR filetype:log OR filetype:bak"
+    echo "site:${target} inurl:admin OR inurl:dashboard OR inurl:login OR inurl:api"
+    echo "site:${target} intitle:\"index of\""
+    echo "site:s3.amazonaws.com \"${slug}\""
+    echo "site:storage.googleapis.com \"${slug}\""
+    echo "site:blob.core.windows.net \"${slug}\""
+    echo "site:${target} ext:xml OR ext:json OR ext:yaml OR ext:conf"
+    echo "site:${target} inurl:config OR inurl:setup OR inurl:backup"
+    echo "\"${target}\" password OR secret OR credentials filetype:txt OR filetype:log"
+    echo "site:pastebin.com \"${target}\""
+    echo "site:trello.com \"${target}\""
+    echo "site:${target} inurl:graphql OR inurl:swagger OR inurl:api-docs"
+  } >"$out"
+
+  log "[$target] Google dorks: $(count_lines "$out") queries → run manually or via GHDB"
+}
+
+phase_screenshots() {
+  local target="$1" dir="$2"
+  local out="$dir/screenshots"
+  log "[$target] Phase 2c: screenshots (visual triage)"
+
+  if ! have gowitness || [ ! -s "$dir/live_hosts.txt" ]; then
+    return
+  fi
+
+  mkdir -p "$out"
+  gowitness scan file -f "$dir/live_hosts.txt" --screenshot-path "$out" \
+    --threads 5 --timeout 15 2>/dev/null || true
+  rate_sleep
+
+  local count
+  count="$(find "$out" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')"
+  log "[$target] Screenshots: ${count} captured → $out/"
+}
+
+phase_github_secrets() {
+  local target="$1" dir="$2"
+  local out="$dir/github_secrets.txt"
+  local tmp="$dir/.tmp"
+  log "[$target] Phase 3f: GitHub secret scanning"
+  : >"$out"
+
+  local org="${target%%.*}"
+
+  # trufflehog — requires GitHub token (skips if not authenticated)
+  if have trufflehog && [ -n "${GITHUB_TOKEN:-}" ]; then
+    timeout 300 trufflehog github --org="$org" --only-verified --json 2>/dev/null \
+      | head -n 100 >>"$out" || true
+    rate_sleep
+  fi
+
+  # gitleaks on top public repos — requires gh auth
+  if have gitleaks && have gh && gh auth status &>/dev/null; then
+    gh api "orgs/${org}/repos?per_page=10&type=public" --jq '.[].clone_url' 2>/dev/null \
+      | head -n 5 | while read -r repo_url; do
+        [ -z "$repo_url" ] && continue
+        local repo_name
+        repo_name="$(basename "$repo_url" .git)"
+        git clone --depth 1 "$repo_url" "$tmp/repo_${repo_name}" 2>/dev/null || continue
+        gitleaks detect --source="$tmp/repo_${repo_name}" -v 2>/dev/null >>"$out" || true
+        rm -rf "$tmp/repo_${repo_name}" 2>/dev/null || true
+      done
+    rate_sleep
+  fi
+
+  # GitHub dork queries (for manual use)
+  {
+    echo "=== GitHub Dork Queries (run manually at github.com) ==="
+    echo "\"${target}\" filename:.env"
+    echo "\"${target}\" DB_PASSWORD"
+    echo "\"${target}\" AWS_SECRET_ACCESS_KEY"
+    echo "\"${target}\" api_key OR api_secret"
+    echo "\"${target}\" extension:sql dump"
+    echo "\"${target}\" filename:.npmrc _auth"
+    echo "\"${target}\" extension:pem private"
+    echo "\"${target}\" client_secret"
+    echo "(path:.env OR path:.yml OR path:.json) AND (access_key OR secret_key) AND \"${target}\""
+  } >"$dir/github_dorks.txt"
+
+  dedupe_file "$out"
+  log "[$target] GitHub secrets: $(count_lines "$out") | dorks → github_dorks.txt"
+}
+
 phase_takeover() {
   local target="$1" dir="$2"
   local subs="$dir/subdomains.txt"
@@ -932,6 +1444,21 @@ write_report() {
     printf "%-22s %s\n" "Nuclei (all):" "$(count_lines "$dir/nuclei_results.txt")"
     printf "%-22s %s\n" "Nuclei crit/high:" "$(count_lines "$dir/nuclei_critical.txt")"
     printf "%-22s %s\n" "Secrets:" "$(count_lines "$dir/secrets.txt")"
+    printf "%-22s %s\n" "OSINT intel:" "$(count_lines "$dir/osint_intel.txt")"
+    printf "%-22s %s\n" "403 bypasses:" "$(count_lines "$dir/403_bypass_results.txt")"
+    printf "%-22s %s\n" "Security headers:" "$(count_lines "$dir/security_headers.txt")"
+    printf "%-22s %s\n" "CSP leaks:" "$(count_lines "$dir/csp_leaks.txt")"
+    printf "%-22s %s\n" "SSL issues:" "$(count_lines "$dir/ssl_issues.txt")"
+    printf "%-22s %s\n" "Open redirects:" "$(count_lines "$dir/open_redirects.txt")"
+    printf "%-22s %s\n" "Keycloak/OIDC:" "$(count_lines "$dir/keycloak_findings.txt")"
+    printf "%-22s %s\n" "WHOIS CNAME:" "$(count_lines "$dir/whois_cname_check.txt")"
+    printf "%-22s %s\n" "ASN hosts:" "$(count_lines "$dir/asn_hosts.txt")"
+    printf "%-22s %s\n" "Backup files:" "$(count_lines "$dir/backup_files.txt")"
+    printf "%-22s %s\n" "Backup files live:" "$(count_lines "$dir/backup_files_live.txt")"
+    printf "%-22s %s\n" "JS cloud URLs:" "$(count_lines "$dir/js_cloud_urls.txt")"
+    printf "%-22s %s\n" "JS removed secrets:" "$(count_lines "$dir/js_removed_secrets.txt")"
+    printf "%-22s %s\n" "GitHub secrets:" "$(count_lines "$dir/github_secrets.txt")"
+    printf "%-22s %s\n" "Fuzz-ready URLs:" "$(count_lines "$dir/fuzz_ready.txt")"
     echo ""
 
     section() {
@@ -961,20 +1488,41 @@ write_report() {
     section "SENSITIVE URLs → Burp" "$dir/sensitive_urls.txt" 40
     section "PRIORITY HOSTS" "$dir/priority_hosts.txt" 25
     section "SECRETS — validate before report" "$dir/secrets.txt" 15
+    section "OSINT INTEL (OTX/urlscan)" "$dir/osint_intel.txt" 20
+    section "403 BYPASS — verify manually" "$dir/403_bypass_results.txt" 20
+    section "SECURITY HEADERS — missing protections" "$dir/security_headers.txt" 30
+    section "CSP LEAKS — internal URLs" "$dir/csp_leaks.txt" 20
+    section "SSL ISSUES — expired/expiring certs" "$dir/ssl_issues.txt" 20
+    section "OPEN REDIRECTS — confirmed" "$dir/open_redirects.txt" 20
+    section "KEYCLOAK/OIDC — auth findings" "$dir/keycloak_findings.txt" 30
+    section "WHOIS CNAME — target domain expiry" "$dir/whois_cname_check.txt" 15
+    section "ASN HOSTS — infrastructure by IP range" "$dir/asn_hosts.txt" 25
+    section "BACKUP FILES LIVE — downloadable backups" "$dir/backup_files_live.txt" 20
+    section "JS CLOUD URLs — cloud infra from JS" "$dir/js_cloud_urls.txt" 20
+    section "JS REMOVED SECRETS — deleted but in Wayback" "$dir/js_removed_secrets.txt" 20
+    section "GITHUB SECRETS — verified leaks" "$dir/github_secrets.txt" 20
+    section "GOOGLE DORKS — run manually" "$dir/google_dorks.txt" 20
+    section "GITHUB DORKS — run manually" "$dir/github_dorks.txt" 15
 
     echo "=== ALL OUTPUT FILES ==="
     ls -1 "$dir"/*.txt 2>/dev/null | sed 's/^/  /'
     echo ""
     echo "=== MANUAL TESTING ORDER ==="
-    echo "  1. subdomains_new.txt + interesting_ports.txt + takeover_candidates.txt"
-    echo "  2. nuclei_critical.txt → confirm each"
-    echo "  3. js_endpoints.txt + secrets.txt"
-    echo "  3. sensitive_paths.txt + dir_fuzz_results.txt + api_fuzz_results.txt"
-    echo "  4. params_ssrf.txt + params_redirect.txt + params_sqli.txt"
-    echo "  5. sensitive_urls.txt → import to Burp"
-    echo "  6. priority_hosts.txt → auth/API testing"
-    echo "  7. urls.txt full review"
-    echo "  8. nmap_results.txt unusual services"
+    echo "  1. nuclei_critical.txt + 403_bypass_results.txt + keycloak_findings.txt"
+    echo "  2. github_secrets.txt + js_removed_secrets.txt + backup_files_live.txt"
+    echo "  3. takeover_candidates.txt + ssl_issues.txt + whois_cname_check.txt"
+    echo "  4. open_redirects.txt + params_ssrf.txt + params_redirect.txt"
+    echo "  5. js_endpoints.txt + secrets.txt + js_cloud_urls.txt"
+    echo "  6. sensitive_paths.txt + dir_fuzz_results.txt + api_fuzz_results.txt"
+    echo "  7. params_sqli.txt + params_idor.txt + lfi_fuzz_results.txt"
+    echo "  8. asn_hosts.txt + screenshots/ (visual triage)"
+    echo "  9. csp_leaks.txt + security_headers.txt + osint_intel.txt"
+    echo " 10. google_dorks.txt + github_dorks.txt → run manually"
+    echo " 11. sensitive_urls.txt + fuzz_ready.txt → import to Burp"
+    echo " 12. priority_hosts.txt → auth/API testing"
+    echo " 13. subdomains_new.txt + interesting_ports.txt"
+    echo " 14. urls.txt full review"
+    echo " 15. nmap_results.txt unusual services"
     echo "================================================================"
   } >"$report"
 }
@@ -983,6 +1531,9 @@ run_target() {
   local target="$1"
   target="$(echo "$target" | tr '[:upper:]' '[:lower:]' | xargs)"
   [ -n "$target" ] || return 0
+
+  # Early exit — skip targets that don't resolve at all
+  host "$target" &>/dev/null || { warn "[$target] does not resolve — skipping"; return 0; }
 
   local dir="${OUTPUT_BASE}/${target}"
   mkdir -p "$dir/.tmp"
@@ -999,17 +1550,38 @@ run_target() {
   phase_scope_filter "$target" "$dir"
   phase_dnsx "$target" "$dir"
   phase_permutations "$target" "$dir"
-  phase_dnsx "$target" "$dir"
+  # Incremental DNS — only resolve subs added by permutations
+  if [ -s "$dir/dns_resolved.txt" ] && [ -s "$dir/subdomains.txt" ] && have dnsx; then
+    comm -23 <(sort "$dir/subdomains.txt") <(sort "$dir/dns_resolved.txt") >"$dir/.tmp/new_subs.txt" 2>/dev/null || true
+    if [ -s "$dir/.tmp/new_subs.txt" ]; then
+      log "[$target] dnsx incremental — $(wc -l <"$dir/.tmp/new_subs.txt") new subs"
+      dnsx -l "$dir/.tmp/new_subs.txt" -a -aaaa -cname -resp -silent 2>/dev/null \
+        | awk '{print $1}' | tr '[:upper:]' '[:lower:]' >>"$dir/dns_resolved.txt"
+      sort -u -o "$dir/dns_resolved.txt" "$dir/dns_resolved.txt"
+    fi
+  fi
+  phase_asn "$target" "$dir"
   phase_live_and_ports "$target" "$dir"
-  phase_urls "$target" "$dir"
-  phase_js_mining "$target" "$dir"
+  fresh_output "$dir/screenshots" || phase_screenshots "$target" "$dir"
+  phase_osint "$target" "$dir"
+  phase_google_dorks "$target" "$dir"
+  fresh_output "$dir/urls.txt" || phase_urls "$target" "$dir"
+  fresh_output "$dir/js_endpoints.txt" || phase_js_mining "$target" "$dir"
   phase_cloud_buckets "$target" "$dir"
+  phase_github_secrets "$target" "$dir"
   phase_params "$target" "$dir"
-  phase_ffuf "$target" "$dir"
+  fresh_output "$dir/dir_fuzz_results.txt" || phase_ffuf "$target" "$dir"
   phase_cewl "$target" "$dir"
-  phase_recursive_ffuf "$target" "$dir"
+  fresh_output "$dir/dir_fuzz_results.txt" || phase_recursive_ffuf "$target" "$dir"
   phase_lfi_probe "$target" "$dir"
   phase_sensitive_paths "$target" "$dir"
+  phase_403_bypass "$target" "$dir"
+  phase_security_headers "$target" "$dir"
+  phase_csp_analysis "$target" "$dir"
+  phase_ssl_check "$target" "$dir"
+  phase_open_redirects "$target" "$dir"
+  phase_keycloak "$target" "$dir"
+  phase_whois_cname "$target" "$dir"
   phase_takeover "$target" "$dir"
   phase_nuclei "$target" "$dir"
   phase_secrets "$target" "$dir"
@@ -1036,6 +1608,20 @@ if [ "$DAEMON" -eq 1 ]; then
   log "Daemon — loop every ${LOOP_HOURS}h | Targets: ${TARGETS[*]}"
   while true; do
     run_cycle
+    # Notify on new findings (Discord/Slack/Telegram)
+    if have notify && [ -f "${SCRIPT_DIR}/notify_config.yaml" ]; then
+      for t in "${TARGETS[@]}"; do
+        local d="${OUTPUT_BASE}/${t}"
+        [ -s "$d/subdomains_new.txt" ] && \
+          sed "s/^/[NEW SUB] /" "$d/subdomains_new.txt" | notify -provider-config "${SCRIPT_DIR}/notify_config.yaml" -bulk 2>/dev/null || true
+        [ -s "$d/nuclei_critical.txt" ] && \
+          sed "s/^/[NUCLEI] /" "$d/nuclei_critical.txt" | notify -provider-config "${SCRIPT_DIR}/notify_config.yaml" -bulk 2>/dev/null || true
+        [ -s "$d/keycloak_findings.txt" ] && \
+          sed "s/^/[AUTH] /" "$d/keycloak_findings.txt" | notify -provider-config "${SCRIPT_DIR}/notify_config.yaml" -bulk 2>/dev/null || true
+        [ -s "$d/github_secrets.txt" ] && \
+          sed "s/^/[SECRET] /" "$d/github_secrets.txt" | notify -provider-config "${SCRIPT_DIR}/notify_config.yaml" -bulk 2>/dev/null || true
+      done
+    fi
     log "Sleeping ${LOOP_HOURS}h..."
     sleep "$(( LOOP_HOURS * 3600 ))"
   done
